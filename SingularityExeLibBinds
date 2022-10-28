@@ -1,0 +1,533 @@
+#!/usr/bin/env python
+#
+# Resolve lists of executables and libraries by name to paths in the current file system.
+#
+
+import argparse
+import subprocess
+import os, sys, errno
+import re
+import logging
+import tempfile, shutil
+import math
+
+
+def filterLineFromFile(lineStr):
+    """Remove comments and leading/trailing whitespace from lines read from files."""
+    lineStr = lineStr.strip()
+    commentCharIdx = lineStr.find('#')
+    if commentCharIdx != -1:
+        lineStr = lineStr[:commentCharIdx].strip()
+    return lineStr
+    
+
+def pathVarToList(pathVar):
+    """Given a list of colon-delimited path strings, return a list of the individual paths."""
+    outPaths = []
+    for pathVal in pathVar:
+        pathVal = pathVal.strip()
+        if pathVal:
+            outPaths.extend(pathVal.split(':'))
+    return outPaths
+
+
+stdLogLevels = [logging.CRITICAL, logging.ERROR, logging.WARNING, logging.INFO, logging.DEBUG]
+def stdLogLevel(verbosity, quietness):
+    """Map an integral verbosity and quietness value to one of the logging levels."""
+    level = 1 + verbosity - quietness
+    if level < 0:
+        level = 0
+    elif level >= len(stdLogLevels):
+        level = len(stdLogLevels) - 1
+    return stdLogLevels[level]
+
+
+StandardSysExeSearchPaths = ['/usr/bin', '/usr/local/bin']
+StandardSysLibSearchPaths = ['/usr/lib64', '/usr/local/lib64', '/usr/lib', '/usr/local/lib']
+StandardSysLibSuffixes = ['.so']
+
+
+def ldconfigMap(ldconfigCacheFile=None):
+    """Generate a dictionary of file names mapped to paths dumped from an ldconfig cache."""
+    cmd = ['ldconfig', '-p']
+    if ldconfigCacheFile:
+        if not os.path.isfile(ldconfigCacheFile):
+            raise RuntimeError('No ldconfig cache file at {:s}'.format(ldconfigCacheFile))
+        cmd.append('-C', ldconfigCacheFile)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    (stdoutStr, stderrStr) = proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError('Failure in ldconfig: {:s}'.format(stderrStr))
+    
+    lineMatch = re.compile('^\s*(.*) \(([^,]+),([^)]+)\)\s*=>\s*(.*)\s*$')
+    libMap = {}
+    for libLine in stdoutStr.splitlines():
+        m = lineMatch.match(libLine)
+        if m is not None:
+            libMap[m.group(1)] = m.group(4)
+    return libMap
+
+
+class PathMap(object):
+
+    def __init__(self, exePrefix='/usr/bin', libPrefix='/usr/lib64'):
+        self._exePrefix = exePrefix
+        self._libPrefix = libPrefix
+    
+    def mapExePath(self, exePath):
+        if not os.path.isfile(exePath):
+            raise RuntimeError('Invalid path passed to mapExeFilename: {:s}'.format(exePath))
+        
+        if self._exePrefix == 'native':
+            return (exePath, exePath)
+        return os.path.join(self._exePrefix, os.path.basename(exePath))
+    
+    def mapLibPath(self, libPath):
+        if not os.path.isfile(libPath):
+            raise RuntimeError('Invalid path passed to mapLibFilename: {:s}'.format(libPath))
+        
+        if self._libPrefix == 'native':
+            return (libPath, libPath)
+        return os.path.join(self._libPrefix, os.path.basename(libPath))
+
+
+class FileAction(object):
+    """Abstract base class for exe/lib actions taken by the program."""
+    
+    def installFile(self, srcName, srcPath, dstPath):
+        raise RuntimeError('FileAction is an abstract base class.')
+    
+    def completeBuild(self):
+        raise RuntimeError('FileAction is an abstract base class.')
+
+
+class BindPoints(FileAction):
+
+    def __init__(self, bindMode=':ro'):
+        self._bindPoints = []
+        self._bindMode = bindMode
+    
+    def installFile(self, srcName, srcPath, dstPath):
+        self._bindPoints.append(os.path.realpath(srcPath) + ':' + dstPath + self._bindMode)
+        logging.debug('    Found {:s} (dst {:s})'.format(srcPath, dstPath))
+        
+    def completeBuild(self):
+
+        if len(self._bindPoints) > 0:
+            print(','.join(self._bindPoints))
+        else:
+            logging.warning('No executable or library mappings discovered.')
+
+
+class OverlayFS(FileAction):
+    """An instance of this class creates a temporary directory to which files can be added to create an overlay EXT3 file system."""
+
+    def __init__(self, baseDir=None, overlayFile='overlay.img'):
+        """Create a overlay root directory pre-populated with the upper and work directories that are required by Singularity."""
+        self.overlayFile = overlayFile
+        self.tmpDir = tempfile.mkdtemp(dir=baseDir)
+        self.installRoot = os.path.join(self.tmpDir, 'upper')
+        os.mkdir(self.installRoot)
+        os.mkdir(os.path.join(self.tmpDir, 'work'))
+        self.totalByteSize = 0
+        self.totalInodeCount = 3
+
+    def __del__(self):
+        """Instance deallocation:  remove the temporary directory!"""
+        import shutil
+        shutil.rmtree(self.tmpDir)
+    
+    def installFile(self, srcName, srcPath, dstPath):
+        """Copy a file at the given srcPath into the overlay file system at dstPath (relative to the upper directory).  Updates the accumulated inode and byte counts.  Exceptions may be raised by the os.mkdir() and shutil.copy2() functions."""
+        dstInstallPath = os.path.join(self.installRoot, dstPath[1:])
+        inodeCount = 0
+        
+        # Check that the parent path exists:
+        mkdirPath = os.path.dirname(dstInstallPath)
+        mkdirList = []
+        while not os.path.isdir(mkdirPath):
+            mkdirList.insert(0, mkdirPath)
+            mkdirPath = os.path.dirname(mkdirPath)
+        for mkdirPath in mkdirList:
+            os.mkdir(mkdirPath)
+            inodeCount += 1
+            
+        if not os.path.exists(dstInstallPath):
+            if os.path.islink(srcPath):
+                # Ensure the target is present in the tree, too:
+                linkTarget = os.readlink(srcPath)
+                if not os.path.isabs(linkTarget):
+                    linkTarget = os.path.join(os.path.dirname(srcPath), linkTarget)
+                linkTarget = os.path.realpath(linkTarget)
+                linkName = os.path.basename(linkTarget)
+                self.installFile(linkName, linkTarget, os.path.join(os.path.dirname(dstPath), linkName))
+                
+                # Now create a symlink:
+                os.symlink(linkName, dstInstallPath)
+                inodeCount += 1
+                logging.debug('    Symlink {:s} at {:s}'.format(srcPath, dstPath))
+            else:
+                shutil.copy2(srcPath, dstInstallPath)
+                inodeCount += 1
+                logging.debug('    Found {:s} (dst {:s})'.format(srcPath, dstPath))
+
+            # Tally-up approx how many bytes were required:
+            self.totalByteSize += os.path.getsize(dstInstallPath)
+        
+        # Tally-up approx how many inodes were used:
+        self.totalInodeCount += inodeCount
+        
+    
+    def calculateImageSizingParameters(self):
+        """Determine how large the underlying image file must be, approx. how many inodes to allow, etc."""
+        # Round inode count to next-highest hundred, add 40% overhead to byte size:
+        return { 'deviceFileSize': max(math.ceil(1.4 * self.totalByteSize), 16 * 1024 * 1024),
+                 'blockSize': 4096,
+                 'inodeSize': 128,
+                 'inodeCount': int(100.0 * math.ceil(self.totalInodeCount / 100.0)),
+                 'journalSize': 4
+                }
+    
+    def completeBuild(self):
+        """Generate an EXT3 image file containing the file system tree under the receiver's temporary directory."""
+        # Step 0:  get sizing parameters:
+        sizing = self.calculateImageSizingParameters()
+        
+        # Step 1:  create the file to hold the image:
+        with open(self.overlayFile, 'wb') as imgFPtr:
+            # 1 MiB block of zeroes:
+            initBlockSize = 1024 * 1024
+            initBlock = bytearray([0]*initBlockSize)
+            initBlockCount = int(math.ceil(float(sizing['deviceFileSize']) / float(initBlockSize)))
+            while initBlockCount:
+                imgFPtr.write(initBlock)
+                initBlockCount -= 1
+        
+        # Step 2:  create the EXT3 image:
+        mkfsCmd = [ 'mke2fs', '-t', 'ext3',
+                    '-E', 'no_copy_xattrs',
+                    '-N', str(sizing['inodeCount']),
+                    '-I', str(sizing['inodeSize']),
+                    '-b', str(sizing['blockSize']),
+                    '-J', 'size={:d}'.format(sizing['journalSize']),
+                    '-d', self.tmpDir,
+                    self.overlayFile
+            ]
+        logging.info('Building overlay EXT3 image in {:s}'.format(self.overlayFile))
+        mkfsProc = subprocess.Popen(mkfsCmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        (stdoutStr, stderrStr) = mkfsProc.communicate()
+        if mkfsProc.returncode != 0:
+            raise RuntimeError('Failed while creating EXT3 image file {:s}: rc={:d} {:s}'.format(self.overlayFile, mkfsProc.returncode, stderrStr))
+        m = re.search(r'Creating filesystem with (\d+) (\S+) blocks and (\d+) inodes', stdoutStr)
+        if m is not None:
+            logging.info('  Initialized with {:s} x {:s} blocks, {:s} inodes'.format(m.group(1), m.group(2), m.group(3)))
+        
+        # Step 3:  compact the image:
+        resize2fsCmd = ['resize2fs', '-M', self.overlayFile]
+        logging.info('Resizing overlay EXT3 image in {:s}'.format(self.overlayFile))
+        resize2fsProc = subprocess.Popen(resize2fsCmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        (stdoutStr, stderrStr) = resize2fsProc.communicate()
+        if resize2fsProc.returncode != 0:
+            raise RuntimeError('Failed while resizing EXT3 image file {:s}: rc={:d} {:s}'.format(self.overlayFile, resize2fsProc.returncode, stderrStr))
+        m = re.search(r'is now (\d+ \([^)]+\)) blocks long.', stdoutStr)
+        if m is not None:
+            logging.info('  Compacted to {:s} blocks'.format(m.group(1)))
+    
+        print('Use the overlay by adding a `--overlay {:s}:ro\' flag to your singularity commands'.format(self.overlayFile))
+
+
+cliParser = argparse.ArgumentParser(description='Resolve executable and library name(s) to absolute file system paths.')
+cliParser.add_argument('-v', '--verbose',
+        dest='verbosity',
+        default=0,
+        action='count',
+        help='Increase the amount of descriptive output produced by the program.')
+cliParser.add_argument('-q', '--quiet',
+        dest='quietness',
+        default=0,
+        action='count',
+        help='Decrease the amount of descriptive output produced by the program.')
+cliParser.add_argument('--read-write',
+        dest='shouldBindReadWrite',
+        default=False,
+        action='store_true',
+        help='Emit read-write bind mounts (default is read-only).')
+cliParser.add_argument('--mode', '-m',
+        dest='mode',
+        choices=('bind-points', 'overlay'),
+        default='bind-points',
+        help='Determines what the product of the executable and library resolution will be:  a `bind-points\' string (the default) or an `overlay\' EXT3 image.')
+cliParser.add_argument('--overlay-path', metavar='<path>',
+        dest='overlayPath',
+        default='overlay.img',
+        help='For overlay mode, generate the overlay image file at the given path (default: `overlay.img\' in the working directory).')
+
+cliParserExe = cliParser.add_argument_group(title='Executables', description='Options that control resolution of executables.')
+cliParserExe.add_argument('--no-env-exe-path',
+        dest='noExePath',
+        default=False,
+        action='store_true',
+        help='Do not resolve libraries using the PATH env var.')
+cliParserExe.add_argument('--no-std-exe-paths',
+        dest='noStdExePaths',
+        default=False,
+        action='store_true',
+        help='Do not automatically include standard system executable paths.')
+cliParserExe.add_argument('--ignore-missing-exe',
+        dest='ignoreMissingExe',
+        default=False,
+        action='store_true',
+        help='Ignore any executables that cannot be resolved.')
+cliParserExe.add_argument('--exe-path', metavar='<path>{:<path>...}',
+        dest='exePath',
+        action='append',
+        default=list(),
+        help='Add a colon-delimited list of paths to the executable search path.')
+cliParserExe.add_argument('--exe', '-x', metavar='<command>',
+        dest='exe',
+        action='append',
+        default=list(),
+        help='Add a named executable to resolve.')
+cliParserExe.add_argument('--exe-from-file', '-X', metavar='<path>',
+        dest='exeFromFile',
+        help='Add executable names from a file, one per line.')
+cliParserExe.add_argument('--exe-bind-root', metavar='<path>',
+        dest='exeBindRoot',
+        default='/usr/bin',
+        help='Bind-mount executables in this target directory; the path in the native OS is reused if the word `native\' is used with this flag.')
+
+cliParserLib = cliParser.add_argument_group(title='Libraries', description='Options that control resolution of shared libraries.')
+cliParserLib.add_argument('--no-ldconfig',
+        dest='noLdConfig',
+        default=False,
+        action='store_true',
+        help='Do not resolve libraries using the ldconfig cache.')
+cliParserLib.add_argument('--no-std-lib-paths',
+        dest='noStdLibPaths',
+        default=False,
+        action='store_true',
+        help='Do not automatically include standard system library paths.')
+cliParserLib.add_argument('--ignore-missing-lib',
+        dest='ignoreMissingLib',
+        default=False,
+        action='store_true',
+        help='Ignore any libraries that cannot be resolved.')
+cliParserLib.add_argument('--ldconfig-cache', metavar='<path>',
+        dest='ldconfigCacheFile',
+        help='Use a non-default ldconfig cache file at <path>.')
+cliParserLib.add_argument('--no-env-library-path',
+        dest='noLibraryPath',
+        action='store_true',
+        help='Do not resolve libraries using the LD_LIBRARY_PATH and LIBRARY_PATH env vars.')
+cliParserLib.add_argument('--library-path', metavar='<path>{:<path>...}',
+        dest='libPath',
+        action='append',
+        default=list(),
+        help='Add a colon-delimited list of paths to the library search path.')
+cliParserLib.add_argument('--lib', '-l', metavar='<name>',
+        dest='lib',
+        action='append',
+        default=list(),
+        help='Add a named library to resolve.')
+cliParserLib.add_argument('--lib-from-file', '-L', metavar='<path>',
+        dest='libFromFile',
+        help='Add library names from a file, one per line.')
+cliParserLib.add_argument('--lib-suffix', metavar='<string>',
+        dest='libSuffixes',
+        action='append',
+        default=list(),
+        help='Filename suffixes used when transforming `-l<name>\' to filenames; if none are provided, the program defaults to using ' + ', '.join(StandardSysLibSuffixes))
+cliParserLib.add_argument('--lib-bind-root', metavar='<path>',
+        dest='libBindRoot',
+        default='/usr/lib64',
+        help='Bind-mount libraries in this target directory; the path in the native OS is reused if the word `native\' is used with this flag.')
+
+# Parge cli arguments:
+cliArgs = cliParser.parse_args()
+
+# Fixup the logging level:
+logging.basicConfig(
+        level=stdLogLevel(cliArgs.verbosity, cliArgs.quietness),
+        format='%(levelname)-8s: %(message)s'
+    )
+
+# Build the list of executables to resolve:
+logging.debug('Building executable names to search')
+exeNames = set(cliArgs.exe)
+if cliArgs.exeFromFile:
+    try:
+        with open(cliArgs.exeFromFile) as fptr:
+            for fileLine in fptr.readlines():
+                fileLine = filterLineFromFile(fileLine)
+                if fileLine:
+                    exeNames.add(fileLine)
+    except Exception as E:
+        logging.error('  Failed to add executable names from {:s}: {:s}'.format(cliArgs.exeFromFile, str(E)))
+        sys.exit(errno.EINVAL)
+logging.debug('  Executable names to search: {:s}'.format(', '.join(exeNames)))
+
+# Build the list of libraries to resolve:
+librarySuffixes = cliArgs.libSuffixes
+if not librarySuffixes:
+    librarySuffixes = StandardSysLibSuffixes
+logging.debug('Building library names to search')
+libNames = set()
+for libName in cliArgs.lib:
+    libName = libName.strip()
+    if libName.startswith('-l'):
+        libNames.update(['lib' + libName[2:] + libSuffix for libSuffix in librarySuffixes])
+    else:
+        libNames.add(libName)
+if cliArgs.libFromFile:
+    try:
+        with open(cliArgs.libFromFile) as fptr:
+            for fileLine in fptr.readlines():
+                fileLine = filterLineFromFile(fileLine)
+                if fileLine:
+                    if fileLine.startswith('-l'):
+                        libNames.update(['lib' + fileLine[2:] + libSuffix for libSuffix in librarySuffixes])
+                    else:
+                        libNames.add(fileLine)
+    except Exception as E:
+        logging.error('  Failed to add library names from {:s}: {:s}'.format(cliArgs.libFromFile, str(E)))
+        sys.exit(errno.EINVAL)
+logging.debug('  Library names to search: {:s}'.format(', '.join(libNames)))
+
+# If we have nothing, we have no work to do:
+if len(exeNames) + len(libNames) > 0:
+    # Create the file action object:
+    if cliArgs.mode == 'bind-points':
+        fileAction = BindPoints(bindMode=(':rw' if cliArgs.shouldBindReadWrite else ':ro'))
+    else:
+        fileAction = OverlayFS(overlayFile=cliArgs.overlayPath)
+    
+    # Build the path mapper:
+    pathMapper = PathMap(exePrefix=cliArgs.exeBindRoot, libPrefix=cliArgs.libBindRoot)
+    
+    # Any executables to seek out?
+    if len(exeNames) > 0:
+        logging.debug('Building executable search path')
+        try:
+            # Append paths from the environment?
+            exeSearchPaths = list()
+            if not cliArgs.noExePath:
+                logging.debug('  - Including value of $PATH')
+                for exeSearchPath in filter(lambda s:len(s) > 0, os.environ.get('PATH', '').split(':')):
+                    if os.path.isdir(exeSearchPath):
+                        exeSearchPaths.append(exeSearchPath)
+                    else:
+                        logging.warn('    No such directory `{:s}\''.format(exeSearchPath))
+            if cliArgs.exePath:
+                logging.debug('  - Including explicit paths provided on command line')
+                for exeSearchPath in pathVarToList(cliArgs.exePath):
+                    if os.path.isdir(exeSearchPath):
+                        exeSearchPaths.append(exeSearchPath)
+                    else:
+                        logging.warn('    No such directory `{:s}\''.format(exeSearchPath))
+            if not cliArgs.noStdExePaths:
+                logging.debug('  - Including default system paths')
+                for exeSearchPath in StandardSysExeSearchPaths:
+                    if os.path.isdir(exeSearchPath):
+                        exeSearchPaths.append(exeSearchPath)
+                    else:
+                        logging.warn('    No such directory `{:s}\''.format(exeSearchPath))
+        except Exception as E:
+            logging.error('  Failed to build executable names and search paths: {:s}'.format(str(E)))
+            sys.exit(1)
+        
+        if len(exeSearchPaths) == 0:
+            logging.error('  No paths present for executable search')
+            sys.exit(errno.EINVAL)
+        
+        logging.debug('Searching for {:d} executable{:s}'.format(len(exeNames), '' if (len(exeNames) == 1) else 's'))
+        for exeName in exeNames:
+            found = False
+            for exeSearchPath in exeSearchPaths:
+                exePath = os.path.join(exeSearchPath, exeName)
+                logging.debug('  Trying {:s}'.format(exePath))
+                if os.path.exists(exePath):
+                    fileAction.installFile(exeName, exePath, pathMapper.mapExePath(exePath))
+                    found = True
+                    break
+            if not found:
+                if cliArgs.ignoreMissingExe:
+                    logging.warning('  Ignored missing executable `{:s}\''.format(exeName))
+                else:
+                    logging.error('  Unable to resolve executable `{:s}\''.format(exeName))
+                    sys.exit(1)
+                    
+        
+    # Any libraries?
+    if len(libNames) > 0:
+        logging.debug('Building library search path')
+        
+        # Get a map from ldconfig if required:
+        try:
+            if cliArgs.noLdConfig:
+                libMap = False
+            else:
+                libMap = ldconfigMap(ldconfigCacheFile=cliArgs.ldconfigCacheFile)
+                keyCount = len(libMap)
+                logging.debug('  - Found {:d} mapping{:s} from ldconfig cache'.format(keyCount, 's' if (keyCount == 1) else ''))
+        
+            # Generate the list of paths:
+            libSearchPaths = list()
+            if not cliArgs.noLibraryPath:
+                logging.debug('  - Including value of $LIBRARY_PATH')
+                for libSearchPath in filter(lambda s:len(s) > 0, os.environ.get('LIBRARY_PATH', '').split(':')):
+                    if os.path.isdir(libSearchPath):
+                        libSearchPaths.append(libSearchPath)
+                    else:
+                        logging.warn('    No such directory `{:s}\''.format(libSearchPath))
+                logging.debug('  - Including value of $LD_LIBRARY_PATH')
+                for libSearchPath in filter(lambda s:len(s) > 0, os.environ.get('LD_LIBRARY_PATH', '').split(':')):
+                    if os.path.isdir(libSearchPath):
+                        libSearchPaths.append(libSearchPath)
+                    else:
+                        logging.warn('    No such directory `{:s}\''.format(libSearchPath))
+            if cliArgs.libPath:
+                logging.debug('  - Including explicit paths provided on command line')
+                for libSearchPath in pathVarToList(cliArgs.libPath):
+                    if os.path.isdir(libSearchPath):
+                        libSearchPaths.append(libSearchPath)
+                    else:
+                        logging.warn('    No such directory `{:s}\''.format(libSearchPath))
+            if not cliArgs.noStdLibPaths:
+                logging.debug('  - Including default system paths')
+                for libSearchPath in StandardSysLibSearchPaths:
+                    if os.path.isdir(libSearchPath):
+                        libSearchPaths.append(libSearchPath)
+                    else:
+                        logging.warn('    No such directory `{:s}\''.format(libSearchPath))
+        except Exception as E:
+            logging.error('  Failed to build library names and search paths: {:s}'.format(str(E)))
+            sys.exit(1)
+        
+        if len(libSearchPaths) == 0 and len(Map) == 0:
+            logging.error('  No paths present for library search')
+            sys.exit(errno.EINVAL)
+        
+        logging.debug('Searching for {:d} librar{:s}'.format(len(exeNames), 'y' if (len(exeNames) == 1) else 'ies'))
+        for libName in libNames:
+            if libMap:
+                logging.debug('  Trying {:s} in ldconfig cache'.format(libName))
+                if libName in libMap:
+                    fileAction.installFile(libName, libMap[libName], pathMapper.mapLibPath(libMap[libName]))
+                    continue
+            
+            found = False
+            for libSearchPath in libSearchPaths:
+                libPath = os.path.join(libSearchPath, libName)
+                logging.debug('  Trying {:s}'.format(libPath))
+                if os.path.exists(libPath):
+                    fileAction.installFile(libName, libPath, pathMapper.mapLibPath(libPath))
+                    found = True
+                    break
+            if not found:
+                if cliArgs.ignoreMissingLib:
+                    logging.warning('  Ignored missing library `{:s}\''.format(libName))
+                else:
+                    logging.error('  Unable to resolve library `{:s}\''.format(libName))
+                    sys.exit(1)
+    
+    fileAction.completeBuild()
