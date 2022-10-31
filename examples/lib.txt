@@ -1,0 +1,12 @@
+#
+# The libraries in this file were captured via the shell command
+#
+#      ls -1 /opt/shared/netcdf/4.7.4/lib/*.so* > examples/lib.txt
+#
+# and this documentation added.
+#
+/opt/shared/netcdf/4.7.4/lib/libh5bzip2.so
+/opt/shared/netcdf/4.7.4/lib/libnetcdf.so
+/opt/shared/netcdf/4.7.4/lib/libnetcdf.so.18
+/opt/shared/netcdf/4.7.4/lib/libnetcdf.so.18.0.0
+

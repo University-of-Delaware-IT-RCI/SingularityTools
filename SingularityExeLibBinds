@@ -42,6 +42,7 @@ def stdLogLevel(verbosity, quietness):
     return stdLogLevels[level]
 
 
+StandardLdConfigCmdPath = '/usr/sbin/ldconfig'
 StandardSysExeSearchPaths = ['/usr/bin', '/usr/local/bin']
 StandardSysLibSearchPaths = ['/usr/lib64', '/usr/local/lib64', '/usr/lib', '/usr/local/lib']
 StandardSysLibSuffixes = ['.so']
@@ -49,11 +50,12 @@ StandardSysLibSuffixes = ['.so']
 
 def ldconfigMap(ldconfigCacheFile=None):
     """Generate a dictionary of file names mapped to paths dumped from an ldconfig cache."""
-    cmd = ['ldconfig', '-p']
+    cmd = [StandardLdConfigCmdPath, '-p']
     if ldconfigCacheFile:
         if not os.path.isfile(ldconfigCacheFile):
             raise RuntimeError('No ldconfig cache file at {:s}'.format(ldconfigCacheFile))
         cmd.append('-C', ldconfigCacheFile)
+    logging.debug('  Issuing command {:s}'.format(' '.join(cmd)))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     (stdoutStr, stderrStr) = proc.communicate()
     if proc.returncode != 0:
@@ -432,7 +434,7 @@ if len(exeNames) + len(libNames) > 0:
                     else:
                         logging.warn('    No such directory `{:s}\''.format(exeSearchPath))
         except Exception as E:
-            logging.error('  Failed to build executable names and search paths: {:s}'.format(str(E)))
+            logging.error('  Failed to build executable search paths: {:s}'.format(str(E)))
             sys.exit(1)
         
         if len(exeSearchPaths) == 0:
@@ -442,13 +444,20 @@ if len(exeNames) + len(libNames) > 0:
         logging.debug('Searching for {:d} executable{:s}'.format(len(exeNames), '' if (len(exeNames) == 1) else 's'))
         for exeName in exeNames:
             found = False
-            for exeSearchPath in exeSearchPaths:
-                exePath = os.path.join(exeSearchPath, exeName)
-                logging.debug('  Trying {:s}'.format(exePath))
-                if os.path.exists(exePath):
+            if os.path.isabs(exeName):
+                if os.path.isfile(exeName):
+                    exePath = exeName
+                    exeName = os.path.basename(exeName)
                     fileAction.installFile(exeName, exePath, pathMapper.mapExePath(exePath))
                     found = True
-                    break
+            else:
+                for exeSearchPath in exeSearchPaths:
+                    exePath = os.path.join(exeSearchPath, exeName)
+                    logging.debug('  Trying {:s}'.format(exePath))
+                    if os.path.exists(exePath):
+                        fileAction.installFile(exeName, exePath, pathMapper.mapExePath(exePath))
+                        found = True
+                        break
             if not found:
                 if cliArgs.ignoreMissingExe:
                     logging.warning('  Ignored missing executable `{:s}\''.format(exeName))
@@ -469,7 +478,7 @@ if len(exeNames) + len(libNames) > 0:
                 libMap = ldconfigMap(ldconfigCacheFile=cliArgs.ldconfigCacheFile)
                 keyCount = len(libMap)
                 logging.debug('  - Found {:d} mapping{:s} from ldconfig cache'.format(keyCount, 's' if (keyCount == 1) else ''))
-        
+                
             # Generate the list of paths:
             libSearchPaths = list()
             if not cliArgs.noLibraryPath:
@@ -500,7 +509,7 @@ if len(exeNames) + len(libNames) > 0:
                     else:
                         logging.warn('    No such directory `{:s}\''.format(libSearchPath))
         except Exception as E:
-            logging.error('  Failed to build library names and search paths: {:s}'.format(str(E)))
+            logging.error('  Failed to build library search paths: {:s}'.format(str(E)))
             sys.exit(1)
         
         if len(libSearchPaths) == 0 and len(Map) == 0:
@@ -509,20 +518,28 @@ if len(exeNames) + len(libNames) > 0:
         
         logging.debug('Searching for {:d} librar{:s}'.format(len(exeNames), 'y' if (len(exeNames) == 1) else 'ies'))
         for libName in libNames:
-            if libMap:
-                logging.debug('  Trying {:s} in ldconfig cache'.format(libName))
-                if libName in libMap:
-                    fileAction.installFile(libName, libMap[libName], pathMapper.mapLibPath(libMap[libName]))
-                    continue
-            
             found = False
-            for libSearchPath in libSearchPaths:
-                libPath = os.path.join(libSearchPath, libName)
-                logging.debug('  Trying {:s}'.format(libPath))
-                if os.path.exists(libPath):
+            if os.path.isabs(libName):
+                logging.debug('  Trying path {:s}'.format(libName))
+                if os.path.isfile(libName):
+                    libPath = libName
+                    libName = os.path.basename(libName)
                     fileAction.installFile(libName, libPath, pathMapper.mapLibPath(libPath))
                     found = True
-                    break
+            else:
+                if libMap:
+                    logging.debug('  Trying {:s} in ldconfig cache'.format(libName))
+                    if libName in libMap:
+                        fileAction.installFile(libName, libMap[libName], pathMapper.mapLibPath(libMap[libName]))
+                        continue
+            
+                for libSearchPath in libSearchPaths:
+                    libPath = os.path.join(libSearchPath, libName)
+                    logging.debug('  Trying {:s}'.format(libPath))
+                    if os.path.exists(libPath):
+                        fileAction.installFile(libName, libPath, pathMapper.mapLibPath(libPath))
+                        found = True
+                        break
             if not found:
                 if cliArgs.ignoreMissingLib:
                     logging.warning('  Ignored missing library `{:s}\''.format(libName))

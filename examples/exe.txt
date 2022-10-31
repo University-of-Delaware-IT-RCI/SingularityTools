@@ -1,0 +1,8 @@
+#
+# Each line should contain a single exectuable name:
+#
+ls
+cat  # Lines can have terminal comments, as well
+cp
+mv
+
