@@ -8,7 +8,7 @@ import subprocess
 import os, sys, errno
 import re
 import logging
-import tempfile, shutil
+import tempfile, shutil, glob
 import math
 
 
@@ -219,7 +219,11 @@ class OverlayFS(FileAction):
         mkfsProc = subprocess.Popen(mkfsCmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         (stdoutStr, stderrStr) = mkfsProc.communicate()
         if mkfsProc.returncode != 0:
-            raise RuntimeError('Failed while creating EXT3 image file {:s}: rc={:d} {:s}'.format(self.overlayFile, mkfsProc.returncode, stderrStr))
+            # Check specifically for the -d flag:
+            if "invalid option -- 'd'" in stderrStr:
+                raise RuntimeError('Failed while creating EXT3 image file: your mke2fs program does not accept the -d flag.  Please ensure a new-enough mke2fs is present on your PATH.')
+            else:
+                raise RuntimeError('Failed while creating EXT3 image file {:s}: rc={:d} {:s}'.format(self.overlayFile, mkfsProc.returncode, stderrStr))
         m = re.search(r'Creating filesystem with (\d+) (\S+) blocks and (\d+) inodes', stdoutStr)
         if m is not None:
             logging.info('  Initialized with {:s} x {:s} blocks, {:s} inodes'.format(m.group(1), m.group(2), m.group(3)))
@@ -238,7 +242,20 @@ class OverlayFS(FileAction):
         print('Use the overlay by adding a `--overlay {:s}:ro\' flag to your singularity commands'.format(self.overlayFile))
 
 
-cliParser = argparse.ArgumentParser(description='Resolve executable and library name(s) to absolute file system paths.')
+exeDirSources = ['contained in $PATH', 'provided via --exe-path']
+exeDirSources.extend(StandardSysExeSearchPaths)
+
+libDirSources = ['contained in $LIBRARY_PATH and $LD_LIBRARY_PATH', 'provided via --lib-path']
+libDirSources.extend(StandardSysLibSearchPaths)
+
+cliParser = argparse.ArgumentParser(
+                    formatter_class=argparse.RawDescriptionHelpFormatter,
+                    description='Generate Singularity bindings or overlay images from native executables or libraries.',
+                    epilog="""
+Executables:  by default, the directories {:s}, and {:s} are searched for executables by name.  Executables can also be specified as absolute paths (e.g. --exe='/usr/bin/l*') for which Unix-style globbing will be applied to generate zero or more matches.
+
+Libraries:  by default, libraries by name are first sought in the ldconfig cache and then by searching the directories {:s}; and {:s}.  Libraries can also be specified as absolute paths (e.g. --lib='/usr/lib64/*cuda*.so*') for which Unix-style globbing will be applied to generate zero or more matches.
+""".format(', '.join(exeDirSources[:-1]), exeDirSources[-1], '; '.join(libDirSources[:-1]), libDirSources[-1]))
 cliParser.add_argument('-v', '--verbose',
         dest='verbosity',
         default=0,
@@ -263,6 +280,11 @@ cliParser.add_argument('--overlay-path', metavar='<path>',
         dest='overlayPath',
         default='overlay.img',
         help='For overlay mode, generate the overlay image file at the given path (default: `overlay.img\' in the working directory).')
+cliParser.add_argument('--no-globbing',
+        dest='shouldGlobAbsPaths',
+        action='store_false',
+        default=True,
+        help='Absolute paths provided for executables or libraries by default have Unix-style globbing applied to them to resolve wildcards, etc.; this flag disables that behavior.')
 
 cliParserExe = cliParser.add_argument_group(title='Executables', description='Options that control resolution of executables.')
 cliParserExe.add_argument('--no-env-exe-path',
@@ -445,11 +467,14 @@ if len(exeNames) + len(libNames) > 0:
         for exeName in exeNames:
             found = False
             if os.path.isabs(exeName):
-                if os.path.isfile(exeName):
-                    exePath = exeName
-                    exeName = os.path.basename(exeName)
-                    fileAction.installFile(exeName, exePath, pathMapper.mapExePath(exePath))
-                    found = True
+                logging.debug('  Trying {:s}'.format(exeName))
+                exeIter = glob.iglob(exeName)
+                for exeMatch in exeIter:
+                    if os.path.isfile(exeMatch):
+                        exePath = exeMatch
+                        exeMatch = os.path.basename(exeMatch)
+                        fileAction.installFile(exeMatch, exePath, pathMapper.mapExePath(exePath))
+                        found = True
             else:
                 for exeSearchPath in exeSearchPaths:
                     exePath = os.path.join(exeSearchPath, exeName)
@@ -520,12 +545,14 @@ if len(exeNames) + len(libNames) > 0:
         for libName in libNames:
             found = False
             if os.path.isabs(libName):
-                logging.debug('  Trying path {:s}'.format(libName))
-                if os.path.isfile(libName):
-                    libPath = libName
-                    libName = os.path.basename(libName)
-                    fileAction.installFile(libName, libPath, pathMapper.mapLibPath(libPath))
-                    found = True
+                logging.debug('  Trying {:s}'.format(libName))
+                libIter = glob.iglob(libName)
+                for libMatch in libIter:
+                    if os.path.isfile(libMatch):
+                        libPath = libMatch
+                        libMatch = os.path.basename(libMatch)
+                        fileAction.installFile(libMatch, libPath, pathMapper.mapLibPath(libPath))
+                        found = True
             else:
                 if libMap:
                     logging.debug('  Trying {:s} in ldconfig cache'.format(libName))
@@ -546,5 +573,7 @@ if len(exeNames) + len(libNames) > 0:
                 else:
                     logging.error('  Unable to resolve library `{:s}\''.format(libName))
                     sys.exit(1)
-    
-    fileAction.completeBuild()
+    try:
+        fileAction.completeBuild()
+    except Exception as E:
+        logging.critical(str(E))
